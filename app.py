@@ -1,464 +1,405 @@
 import re
 import hashlib
-import datetime as dt
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Optional, Tuple
-
+from datetime import datetime, date
 import pandas as pd
 import streamlit as st
-from difflib import SequenceMatcher
 
+st.set_page_config(page_title="Patient Insight Analyzer", layout="wide")
 
-# -----------------------------
-# Helpers: normalization & hashing
-# -----------------------------
-def normalize_text(s: str) -> str:
-    if not s:
-        return ""
-    s = s.lower()
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# ----------------------------
+# Helpers
+# ----------------------------
 
-def sha256(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+MONTHS = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
 
-def similarity(a: str, b: str) -> float:
-    """0..1 similarity; use only on normalized strings"""
-    if not a and not b:
-        return 1.0
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a, b).ratio()
+def mask_pii(text: str) -> str:
+    """Mask obvious emails and phone-like numbers to reduce accidental PII retention."""
+    if not text:
+        return text
+    # emails
+    text = re.sub(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[EMAIL]", text, flags=re.I)
+    # phone-ish: long digit runs incl +61 / spaces
+    text = re.sub(r"\b(?:\+?\d[\d\s-]{7,}\d)\b", "[PHONE]", text)
+    return text
 
+def stable_hash(s: str) -> str:
+    s_norm = re.sub(r"\s+", " ", (s or "").strip().lower())
+    return hashlib.sha256(s_norm.encode("utf-8")).hexdigest()[:16]
 
-# -----------------------------
-# Age banding
-# -----------------------------
-def age_to_band_3yr(age: Optional[int]) -> Optional[str]:
-    if age is None:
-        return None
-    if age < 0:
-        return None
-    start = (age // 3) * 3
-    end = start + 2
-    return f"{start}-{end}"
-
-
-# -----------------------------
-# Core record
-# -----------------------------
-@dataclass
-class ConsultRecord:
-    consult_id: Optional[str] = None
-    created_at: Optional[str] = None
-
-    suburb: Optional[str] = None
-    state: Optional[str] = None
-
-    age: Optional[int] = None
-    age_band_3yr: Optional[str] = None
-    gender: Optional[str] = None  # "Female" | "Male" only
-
-    leave_category: Optional[str] = None
-    reason: Optional[str] = None
-    days: Optional[int] = None
-    certificate_start: Optional[str] = None
-    certificate_end: Optional[str] = None
-
-    symptoms_text: Optional[str] = None
-    transcript_text: Optional[str] = None
-    transcript_present: bool = False
-
-    raw_block_hash: Optional[str] = None
-    fingerprint: Optional[str] = None
-
-
-# -----------------------------
-# Parsing: messy copy/paste blocks
-# -----------------------------
-STATE_RE = r"(NSW|VIC|QLD|SA|WA|TAS|ACT|NT)"
-SUBURB_STATE_RE = re.compile(rf"([A-Za-z][A-Za-z\s'\-]+)\s+({STATE_RE}),\s*Australia", re.IGNORECASE)
-DURATION_RE = re.compile(r"Duration\s*\n\s*(\d+)\s*day", re.IGNORECASE)
-LEAVE_CAT_RE = re.compile(r"Leave Category\s*\n\s*([A-Za-z]+)", re.IGNORECASE)
-REASON_RE = re.compile(r"Certificate Details\s*\n\s*([A-Za-z ]+)", re.IGNORECASE)
-SYMPTOMS_RE = re.compile(r"Symptoms\s*\n\s*(.+?)(?:\n\s*Certificate Period|\Z)", re.IGNORECASE | re.DOTALL)
-CERT_PERIOD_RE = re.compile(r"Certificate Period\s*\n\s*([0-9]{1,2}\s+\w+)\s*→\s*([0-9]{1,2}\s+\w+)", re.IGNORECASE)
-AGE_INLINE_RE = re.compile(r"(\d{1,3})\s*yrs|\b(\d{1,3})\s*years?\s*old\b", re.IGNORECASE)
-DOB_RE = re.compile(r"\b(\d{1,2})\s+(\w+)\s+(\d{4})\b", re.IGNORECASE)  # e.g. 18 November 2003
-GENDER_RE = re.compile(r"\b(Female|Male)\b", re.IGNORECASE)
-
-TRANSCRIPT_MARKERS = [
-    "Doccy Agent",
-    "I'm the pre consult",
-    "preconsult",
-    "pre consult",
-    "transfer you to a clinician",
-]
-
-
-def split_into_blocks(raw: str) -> List[str]:
+def split_cases(raw: str) -> list[str]:
     """
-    Split large paste into likely consult blocks.
-    Heuristic: split on repeated "Medical Certificate" headings.
+    Split bulk paste into case blocks.
+    Your data repeats 'Certificate Details' — that’s a strong delimiter.
     """
     raw = raw.strip()
     if not raw:
         return []
+    # Keep delimiter in blocks
+    parts = re.split(r"(?=Certificate Details)", raw)
+    # Filter tiny junk chunks
+    blocks = [p.strip() for p in parts if len(p.strip()) > 80]
+    return blocks
 
-    # Insert a separator before "Medical Certificate" if it appears multiple times
-    parts = re.split(r"\n\s*Medical Certificate\s*\n", raw, flags=re.IGNORECASE)
-    if len(parts) == 1:
-        return [raw]
-
-    blocks = []
-    # The first chunk may contain address header; subsequent chunks are true blocks
-    # Re-add the marker for consistency
-    for i, p in enumerate(parts):
-        p = p.strip()
-        if not p:
-            continue
-        if i == 0 and len(parts) > 1:
-            # keep it attached to next block if very small
-            if len(p) < 200:
-                continue
-        blocks.append(("Medical Certificate\n" + p) if i > 0 else p)
-
-    return blocks if blocks else [raw]
-
-
-def extract_transcript(block: str) -> Optional[str]:
-    # If it contains any transcript markers, try to capture from the first "Doccy Agent" onward
-    idx = None
-    for m in ["Doccy Agent", "Michael Addis", "Doctor", "00:00", "00:01"]:
-        pos = block.find(m)
-        if pos != -1:
-            idx = pos if idx is None else min(idx, pos)
-    if idx is None:
-        # fallback if contains markers
-        if any(k.lower() in block.lower() for k in TRANSCRIPT_MARKERS):
-            return block
-        return None
-
-    snippet = block[idx:].strip()
-    # Avoid accidentally storing giant admin logs only
-    return snippet if len(snippet) > 50 else None
-
-
-def parse_block(block: str) -> ConsultRecord:
-    rec = ConsultRecord()
-    rec.raw_block_hash = sha256(normalize_text(block))
-
-    # suburb/state
-    m = SUBURB_STATE_RE.search(block)
+def parse_suburb_state(block: str):
+    # Common pattern: "Wolli Creek NSW, Australia"
+    m = re.search(r"\n\s*([A-Za-z][A-Za-z\s'.-]+)\s+(NSW|VIC|QLD|SA|WA|TAS|ACT|NT)\s*,\s*Australia", block)
     if m:
-        rec.suburb = m.group(1).strip()
-        rec.state = m.group(2).upper()
+        return m.group(1).strip(), m.group(2).strip()
+    return None, None
 
-    # reason
-    m = REASON_RE.search(block)
-    if m:
-        rec.reason = m.group(1).strip()
+def parse_leave_category(block: str):
+    m = re.search(r"Leave Category\s*\n\s*\n\s*(Work|University|School|Other)\b", block, flags=re.I)
+    return m.group(1).title() if m else None
 
-    # leave category
-    m = LEAVE_CAT_RE.search(block)
+def parse_certificate_detail(block: str):
+    # After "Certificate Details" the next non-empty line is usually the reason bucket (e.g., Period Pain)
+    m = re.search(r"Certificate Details\s*\n\s*([^\n]+)", block)
     if m:
-        rec.leave_category = m.group(1).strip()
+        val = m.group(1).strip()
+        # Sometimes the next line is empty; guard against headings
+        if val.lower() not in {"leave category", "certificate period", "symptoms"}:
+            return val
+    return None
 
-    # duration/days
-    m = DURATION_RE.search(block)
+def parse_symptoms(block: str):
+    m = re.search(r"Symptoms\s*\n\s*\n\s*(.+?)\n\s*\n\s*Certificate Period", block, flags=re.S)
     if m:
+        return re.sub(r"\s+", " ", m.group(1).strip())
+    return None
+
+def parse_cert_date(block: str):
+    """
+    Try multiple patterns:
+    - "15/12/25, 11:36 pm"
+    - "15/12/2025"
+    - Certificate Period lines "15 Dec → 15 Dec" (assume current year if none)
+    """
+    # dd/mm/yy or dd/mm/yyyy
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b", block)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000
         try:
-            rec.days = int(m.group(1))
-        except:
-            rec.days = None
+            return date(y, mo, d)
+        except ValueError:
+            pass
 
-    # certificate period
-    m = CERT_PERIOD_RE.search(block)
-    if m:
-        rec.certificate_start = m.group(1).strip()
-        rec.certificate_end = m.group(2).strip()
-
-    # symptoms
-    m = SYMPTOMS_RE.search(block)
-    if m:
-        rec.symptoms_text = m.group(1).strip()
-        # clean repeated whitespace
-        rec.symptoms_text = re.sub(r"\s+", " ", rec.symptoms_text).strip()
-
-    # gender (strict)
-    m = GENDER_RE.search(block)
-    if m:
-        g = m.group(1).strip().lower()
-        rec.gender = "Female" if g == "female" else "Male"
-
-    # age (if present)
-    m = AGE_INLINE_RE.search(block)
-    age = None
-    if m:
-        age_str = m.group(1) or m.group(2)
-        try:
-            age = int(age_str)
-        except:
-            age = None
-
-    # fallback: compute age from DOB if you pasted DOB
-    if age is None:
-        dob = DOB_RE.search(block)
-        if dob:
-            day = int(dob.group(1))
-            month_name = dob.group(2).lower()
-            year = int(dob.group(3))
+    # "15 Dec" style
+    m2 = re.search(r"Certificate Period\s*\n\s*\n\s*(\d{1,2})\s+([A-Za-z]+)", block)
+    if m2:
+        d = int(m2.group(1))
+        mon = MONTHS.get(m2.group(2).strip().lower()[:3])
+        if mon:
+            y = datetime.now().year
             try:
-                month_map = {
-                    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-                    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
-                }
-                month = month_map.get(month_name)
-                if month:
-                    dob_dt = dt.date(year, month, day)
-                    today = dt.date.today()
-                    age = today.year - dob_dt.year - ((today.month, today.day) < (dob_dt.month, dob_dt.day))
-            except:
-                age = None
+                return date(y, mon, d)
+            except ValueError:
+                pass
 
-    rec.age = age
-    rec.age_band_3yr = age_to_band_3yr(age)
+    return None
 
-    # transcript
-    transcript = extract_transcript(block)
-    if transcript:
-        rec.transcript_text = transcript
-        rec.transcript_present = True
-
-    # fingerprint: used for merging duplicates across pastes
-    # Use stable, low-PHI-ish fields. (You can adjust)
-    fp_source = "|".join([
-        normalize_text(rec.suburb or ""),
-        normalize_text(rec.state or ""),
-        normalize_text(rec.reason or ""),
-        normalize_text(rec.leave_category or ""),
-        normalize_text(rec.certificate_start or ""),
-        normalize_text(rec.certificate_end or ""),
-        str(rec.days or ""),
-        normalize_text((rec.symptoms_text or "")[:120]),   # limit for stability + privacy
-    ])
-    rec.fingerprint = sha256(fp_source)
-
-    return rec
-
-
-# -----------------------------
-# Deduplication & merge
-# -----------------------------
-def merge_records(a: ConsultRecord, b: ConsultRecord) -> ConsultRecord:
+def parse_gender(block: str):
     """
-    Merge b into a, keeping the "best" / most complete fields.
-    - Prefer non-empty values
-    - For transcript/symptoms, keep longer
+    User said: female and male only.
+    We’ll look for explicit 'male'/'female' mentions if present.
+    If not present, leave blank (don’t guess).
     """
-    def pick(x, y):
-        return x if x not in [None, ""] else y
+    if re.search(r"\bfemale\b", block, flags=re.I):
+        return "Female"
+    if re.search(r"\bmale\b", block, flags=re.I):
+        return "Male"
+    return None
 
-    a.consult_id = pick(a.consult_id, b.consult_id)
-    a.created_at = pick(a.created_at, b.created_at)
-    a.suburb = pick(a.suburb, b.suburb)
-    a.state = pick(a.state, b.state)
-    a.gender = pick(a.gender, b.gender)
-    a.leave_category = pick(a.leave_category, b.leave_category)
-    a.reason = pick(a.reason, b.reason)
-    a.days = a.days if a.days is not None else b.days
-    a.certificate_start = pick(a.certificate_start, b.certificate_start)
-    a.certificate_end = pick(a.certificate_end, b.certificate_end)
+def compute_age_from_dob(dob: date, asof: date | None = None) -> int | None:
+    asof = asof or date.today()
+    if dob > asof:
+        return None
+    years = asof.year - dob.year - ((asof.month, asof.day) < (dob.month, dob.day))
+    if 0 <= years <= 110:
+        return years
+    return None
 
-    # age / age_band
-    a.age = a.age if a.age is not None else b.age
-    a.age_band_3yr = a.age_band_3yr if a.age_band_3yr is not None else b.age_band_3yr
-
-    # symptoms: keep longer
-    if (b.symptoms_text or "") and len(b.symptoms_text) > len(a.symptoms_text or ""):
-        a.symptoms_text = b.symptoms_text
-
-    # transcript: keep longer / more complete
-    if (b.transcript_text or "") and len(b.transcript_text) > len(a.transcript_text or ""):
-        a.transcript_text = b.transcript_text
-
-    a.transcript_present = bool(a.transcript_text)
-    return a
-
-
-def dedupe_and_merge(records: List[ConsultRecord], near_dup_threshold: float = 0.97) -> Tuple[List[ConsultRecord], Dict[str, Any]]:
+def parse_age(block: str):
     """
-    Two-layer dedupe:
-    1) Exact: same raw_block_hash or same fingerprint
-    2) Near-dup: compare normalized (symptoms+transcript) similarity
+    Fix for your '322' issue:
+    - Only accept 1–2 digit ages when using 'yrs' pattern.
+    - If DOB exists (e.g., '18 November 2003'), compute age.
+    - Do NOT treat any 3+ digit number as age.
     """
-    stats = {"input": len(records), "exact_merged": 0, "near_merged": 0}
+    # "22yrs" pattern (limit to 1-2 digits)
+    m = re.search(r"\b(\d{1,2})\s*(?:yrs|years|yo|y/o)\b", block, flags=re.I)
+    if m:
+        age = int(m.group(1))
+        if 0 < age <= 110:
+            return age
 
-    # Exact merge by fingerprint (preferred) then raw_block_hash
-    by_fp: Dict[str, ConsultRecord] = {}
-    for r in records:
-        key = r.fingerprint or r.raw_block_hash
-        if key in by_fp:
-            by_fp[key] = merge_records(by_fp[key], r)
-            stats["exact_merged"] += 1
-        else:
-            by_fp[key] = r
+    # DOB pattern: "18 November 2003"
+    m2 = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b", block)
+    if m2:
+        d = int(m2.group(1))
+        mon_name = m2.group(2).strip().lower()
+        y = int(m2.group(3))
+        mon = MONTHS.get(mon_name[:3])
+        if mon:
+            try:
+                dob = date(y, mon, d)
+                return compute_age_from_dob(dob)
+            except ValueError:
+                pass
 
-    deduped = list(by_fp.values())
+    return None
 
-    # Near-dup merge (expensive but ok for early v1)
-    used = [False] * len(deduped)
-    merged: List[ConsultRecord] = []
+def age_cluster_3yr(age: int | None):
+    if age is None:
+        return None
+    base = (age // 3) * 3
+    return f"{base}-{base+2}"
 
-    for i in range(len(deduped)):
-        if used[i]:
-            continue
-        base = deduped[i]
-        base_text = normalize_text((base.symptoms_text or "") + " " + (base.transcript_text or ""))
-        for j in range(i + 1, len(deduped)):
-            if used[j]:
-                continue
-            cand = deduped[j]
-            cand_text = normalize_text((cand.symptoms_text or "") + " " + (cand.transcript_text or ""))
+# ----------------------------
+# Psychology / intent tagging
+# ----------------------------
 
-            # Only compare if they share some anchors to avoid accidental merges
-            same_reason = normalize_text(base.reason or "") == normalize_text(cand.reason or "")
-            same_days = (base.days == cand.days) or (base.days is None or cand.days is None)
-            same_suburb = normalize_text(base.suburb or "") == normalize_text(cand.suburb or "")
+INTENT_RULES = [
+    ("Same-day urgency", [
+        r"\btoday\b", r"\btonight\b", r"\bnow\b", r"\bASAP\b", r"\bcan't attend\b", r"\bunable to attend\b"
+    ]),
+    ("Short leave (1 day)", [
+        r"\b1 day\b", r"\bone day\b", r"\bjust today\b"
+    ]),
+    ("Legitimacy reassurance", [
+        r"\blegit\b", r"\bvalid\b", r"\baccepted\b", r"\bonline\b", r"\btelehealth\b"
+    ]),
+    ("Work compliance pressure", [
+        r"\bwork\b", r"\bmanager\b", r"\bemployer\b", r"\bHR\b", r"\bsupervisor\b"
+    ]),
+    ("Caregiver responsibility", [
+        r"\bkid\b", r"\bkids\b", r"\bdaughter\b", r"\bson\b", r"\blooking after\b"
+    ]),
+    ("Pain-driven", [
+        r"\bpain\b", r"\bdysmenorrhea\b", r"\bheadache\b", r"\bback pain\b", r"\bcramps?\b"
+    ]),
+    ("Infectious concern", [
+        r"\bflu\b", r"\bcold\b", r"\bfever\b", r"\bvomi(t|ting)\b", r"\bdiarrh\w+\b", r"\bgastro\b"
+    ]),
+    ("Mental wellbeing & functioning", [
+        r"\banxiety\b", r"\bstress\b", r"\blow mood\b", r"\bdepress\w+\b", r"\bconcentration\b"
+    ]),
+]
 
-            if not (same_reason and same_days and (same_suburb or not base.suburb or not cand.suburb)):
-                continue
+def tag_intents(text: str) -> list[str]:
+    t = (text or "")
+    tags = []
+    for name, pats in INTENT_RULES:
+        for p in pats:
+            if re.search(p, t, flags=re.I):
+                tags.append(name)
+                break
+    return tags
 
-            sim = similarity(base_text, cand_text)
-            if sim >= near_dup_threshold:
-                base = merge_records(base, cand)
-                used[j] = True
-                stats["near_merged"] += 1
+def suggest_ad_baskets(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    High-level themed clusters for ad strategy.
+    Predictability = how tightly the theme maps to common, explicit intent phrases in your dataset.
+    (This is a heuristic score from the text you pasted — not Google’s actual search data.)
+    """
+    baskets = [
+        ("Same-Day Certificate (Work)", ["Same-day urgency", "Work compliance pressure"], 0.80),
+        ("1-Day Sick Leave Proof", ["Short leave (1 day)", "Work compliance pressure"], 0.75),
+        ("Cold/Flu Quick Note", ["Infectious concern", "Same-day urgency"], 0.70),
+        ("Gastro / Up All Night", ["Infectious concern", "Short leave (1 day)"], 0.70),
+        ("Period Pain Privacy", ["Pain-driven", "Short leave (1 day)"], 0.65),
+        ("Back Pain / Injury", ["Pain-driven", "Work compliance pressure"], 0.60),
+        ("Caregiver (Child Sick)", ["Caregiver responsibility", "Work compliance pressure"], 0.60),
+        ("Mental Health Study/Work Day Off", ["Mental wellbeing & functioning"], 0.55),
+        ("Legit/Accepted Online Cert", ["Legitimacy reassurance"], 0.50),
+    ]
+    rows = []
+    for name, required, score in baskets:
+        # Count cases that contain all required tags
+        hit = df["intent_tags"].apply(lambda tags: all(r in (tags or []) for r in required)).sum()
+        rows.append({
+            "Basket": name,
+            "Required intent tags": ", ".join(required),
+            "Matches in your data": int(hit),
+            "Predictability (heuristic)": score
+        })
+    return pd.DataFrame(rows).sort_values(["Matches in your data", "Predictability (heuristic)"], ascending=False)
 
-        merged.append(base)
+def negative_keywords_seed():
+    """
+    Starter negatives to reduce junk spend.
+    You MUST review these for your market + compliance.
+    """
+    return [
+        # Employment/legal
+        "fake", "forged", "template", "blank", "download", "pdf template", "free", "edit", "photoshop",
+        # Medical diagnosis / emergencies
+        "chest pain", "stroke", "slurred speech", "difficulty breathing", "emergency",
+        # Employer-side
+        "verify certificate", "call doctor", "contact provider",
+        # Competitor / irrelevant
+        "Centrelink medical certificate form", "workers comp claim form",
+        # Price hunters / misfit intent
+        "cheapest", "free medical certificate", "bulk discount",
+        # Students if you only want work (remove if you DO want students)
+        "uni special consideration", "exam deferral",
+    ]
 
-    stats["output"] = len(merged)
-    return merged, stats
+# ----------------------------
+# UI
+# ----------------------------
 
+st.title("Bulk Paste → De-dupe → Insights (Streamlit)")
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="Med Cert Market Analyzer (v1)", layout="wide")
+if "cases_df" not in st.session_state:
+    st.session_state.cases_df = pd.DataFrame()
 
-st.title("Med Cert Market Analyzer (v1) — Bulk paste → parse → dedupe → analyse")
+with st.sidebar:
+    st.header("Settings")
+    st.caption("You can paste repeatedly; duplicates are automatically ignored.")
+    show_raw = st.toggle("Show parsed rows", value=True)
+    show_blocks = st.toggle("Show detected blocks", value=False)
 
-st.info(
-    "Tip: Paste in batches. This app stores every paste in session state until you clear it. "
-    "Duplicates and near-duplicates are merged automatically."
+st.subheader("1) Paste transcripts / case text")
+raw = st.text_area(
+    "Paste here (you can paste many cases at once).",
+    height=240,
+    placeholder="Paste the de-identified cases here…"
 )
 
-if "raw_pastes" not in st.session_state:
-    st.session_state.raw_pastes = []  # list[str]
-if "records" not in st.session_state:
-    st.session_state.records = []  # list[ConsultRecord]
-
-colA, colB = st.columns([2, 1])
-
+colA, colB, colC = st.columns([1, 1, 2])
 with colA:
-    raw = st.text_area("Paste consult blocks here (you can paste multiple consults at once):", height=240)
-
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        if st.button("Add paste to batch"):
-            if raw.strip():
-                st.session_state.raw_pastes.append(raw.strip())
-                st.success(f"Added paste #{len(st.session_state.raw_pastes)} to batch.")
-            else:
-                st.warning("Nothing pasted.")
-
-    with c2:
-        if st.button("Parse batch (no dedupe)"):
-            all_blocks = []
-            for p in st.session_state.raw_pastes:
-                all_blocks.extend(split_into_blocks(p))
-            new_records = [parse_block(b) for b in all_blocks]
-            st.session_state.records = new_records
-            st.success(f"Parsed {len(new_records)} records from {len(all_blocks)} blocks.")
-
-    with c3:
-        if st.button("Parse + Dedupe + Merge"):
-            all_blocks = []
-            for p in st.session_state.raw_pastes:
-                all_blocks.extend(split_into_blocks(p))
-            parsed = [parse_block(b) for b in all_blocks]
-            merged, stats = dedupe_and_merge(parsed, near_dup_threshold=0.97)
-            st.session_state.records = merged
-            st.success(f"Done. Input: {stats['input']} → Output: {stats['output']} "
-                       f"(exact merged: {stats['exact_merged']}, near merged: {stats['near_merged']}).")
-
+    do_add = st.button("Add to dataset", type="primary")
 with colB:
-    st.subheader("Batch controls")
-    st.write(f"Raw pastes stored: **{len(st.session_state.raw_pastes)}**")
-    st.write(f"Current records: **{len(st.session_state.records)}**")
+    do_clear = st.button("Clear dataset")
+with colC:
+    st.write("")
 
-    if st.button("Clear batch + records"):
-        st.session_state.raw_pastes = []
-        st.session_state.records = []
-        st.success("Cleared.")
+if do_clear:
+    st.session_state.cases_df = pd.DataFrame()
+    st.success("Dataset cleared.")
 
-    st.subheader("Dedup sensitivity")
-    near_thr = st.slider("Near-duplicate threshold", 0.90, 0.995, 0.97, 0.001)
-    st.caption("Higher = merges only very similar blocks. If you paste lots of repeats, keep ~0.97–0.985.")
+if do_add:
+    clean = mask_pii(raw)
+    blocks = split_cases(clean)
 
-# Display records
+    if show_blocks and blocks:
+        st.info(f"Detected {len(blocks)} case blocks")
+        st.code(blocks[0][:2000])
+
+    rows = []
+    for b in blocks:
+        rows.append({
+            "case_id": stable_hash(b),
+            "suburb": parse_suburb_state(b)[0],
+            "state": parse_suburb_state(b)[1],
+            "leave_category": parse_leave_category(b),
+            "certificate_detail": parse_certificate_detail(b),
+            "symptoms": parse_symptoms(b),
+            "cert_date": parse_cert_date(b),
+            "gender": parse_gender(b),
+            "age": parse_age(b),
+            "raw_block": b
+        })
+
+    new_df = pd.DataFrame(rows).drop_duplicates(subset=["case_id"])
+    if st.session_state.cases_df.empty:
+        st.session_state.cases_df = new_df
+    else:
+        merged = pd.concat([st.session_state.cases_df, new_df], ignore_index=True)
+        merged = merged.drop_duplicates(subset=["case_id"]).reset_index(drop=True)
+        st.session_state.cases_df = merged
+
+    st.success(f"Added {len(new_df)} unique cases. Total now: {len(st.session_state.cases_df)}")
+
+df = st.session_state.cases_df.copy()
+
 st.divider()
-st.subheader("Parsed records")
+st.subheader("2) Parsed dataset + quality checks")
 
-if st.session_state.records:
-    df = pd.DataFrame([asdict(r) for r in st.session_state.records])
+if df.empty:
+    st.warning("No cases yet. Paste text above and click **Add to dataset**.")
+    st.stop()
 
-    # Enforce gender rule for reporting
-    df["gender"] = df["gender"].apply(lambda x: x if x in ["Female", "Male"] else None)
+# Derived fields
+df["age_cluster_3yr"] = df["age"].apply(age_cluster_3yr)
+df["text_for_intent"] = (
+    df["certificate_detail"].fillna("") + " | " +
+    df["leave_category"].fillna("") + " | " +
+    df["symptoms"].fillna("") + " | " +
+    df["raw_block"].fillna("")
+)
+df["intent_tags"] = df["text_for_intent"].apply(tag_intents)
 
-    # Ensure 3-year clustering always present if age exists
-    df["age_band_3yr"] = df.apply(lambda row: row["age_band_3yr"] or age_to_band_3yr(row["age"]), axis=1)
+# Data quality checks (helps you see why insights might be empty)
+qc1, qc2, qc3, qc4 = st.columns(4)
+qc1.metric("Cases", len(df))
+qc2.metric("Age present", int(df["age"].notna().sum()))
+qc3.metric("Suburb present", int(df["suburb"].notna().sum()))
+qc4.metric("Symptoms present", int(df["symptoms"].notna().sum()))
 
-    # Quick filters
-    f1, f2, f3, f4 = st.columns(4)
-    with f1:
-        reason_filter = st.multiselect("Reason", sorted([x for x in df["reason"].dropna().unique()]))
-    with f2:
-        state_filter = st.multiselect("State", sorted([x for x in df["state"].dropna().unique()]))
-    with f3:
-        gender_filter = st.multiselect("Gender", ["Female", "Male"])
-    with f4:
-        transcript_filter = st.selectbox("Transcript present", ["All", "Yes", "No"], index=0)
-
-    fdf = df.copy()
-    if reason_filter:
-        fdf = fdf[fdf["reason"].isin(reason_filter)]
-    if state_filter:
-        fdf = fdf[fdf["state"].isin(state_filter)]
-    if gender_filter:
-        fdf = fdf[fdf["gender"].isin(gender_filter)]
-    if transcript_filter == "Yes":
-        fdf = fdf[fdf["transcript_present"] == True]
-    elif transcript_filter == "No":
-        fdf = fdf[fdf["transcript_present"] == False]
-
+if show_raw:
     st.dataframe(
-        fdf[
-            [
-                "suburb", "state", "age", "age_band_3yr", "gender",
-                "leave_category", "reason", "days",
-                "certificate_start", "certificate_end",
-                "transcript_present",
-                "symptoms_text",
-            ]
-        ],
+        df.drop(columns=["raw_block", "text_for_intent"]),
         use_container_width=True,
-        height=420
+        hide_index=True
     )
 
-    # Export
-    csv = fdf.to_csv(index=False).encode("utf-8")
-    st.download_button("Download filtered CSV", data=csv, file_name="consults_filtered.csv", mime="text/csv")
+st.divider()
+st.subheader("3) Insights that should always render")
 
-else:
-    st.warning("No records yet. Paste blocks → Add to batch → Parse + Dedupe + Merge.")
+left, right = st.columns(2)
+
+with left:
+    st.markdown("**Top certificate reasons**")
+    st.dataframe(
+        df["certificate_detail"].fillna("Unknown").value_counts().head(12).reset_index()
+          .rename(columns={"index": "certificate_detail", "certificate_detail": "count"}),
+        use_container_width=True,
+        hide_index=True
+    )
+
+with right:
+    st.markdown("**Top intent tags (psychology/decision drivers)**")
+    tag_counts = (
+        df["intent_tags"]
+        .explode()
+        .dropna()
+        .value_counts()
+        .reset_index()
+        .rename(columns={"index": "intent_tag", "intent_tags": "count"})
+    )
+    st.dataframe(tag_counts, use_container_width=True, hide_index=True)
+
+st.divider()
+st.subheader("4) Ad strategy baskets (with predictability %)")
+
+baskets_df = suggest_ad_baskets(df)
+st.dataframe(baskets_df, use_container_width=True, hide_index=True)
+
+st.divider()
+st.subheader("5) Negative keyword seed list (starter)")
+
+neg = negative_keywords_seed()
+st.code("\n".join(neg))
+
+st.divider()
+st.subheader("6) Export")
+
+export_df = df.drop(columns=["raw_block", "text_for_intent"])
+csv = export_df.to_csv(index=False).encode("utf-8")
+st.download_button("Download CSV", data=csv, file_name="patient_insights.csv", mime="text/csv")
